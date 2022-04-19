@@ -1,5 +1,5 @@
 #include <math.h>
-#define DEBUG 1
+#define DEBUG 0
 //总状态机 可用于串口通信
 #define STOP 0xAA
 #define PULSE 0xBB
@@ -7,6 +7,7 @@
 
 //串口通信字节
 #define WAKE_BYTE '+'
+#define QUIT_BYTE 0x2C
 #define STAGE_A_BYTE 0xA0
 #define STAGE_B_BYTE 0xB0
 #define OVR_BYTE '-'
@@ -47,47 +48,47 @@
 #define CENTER 33
 #define RIGHT 32
 #define RIGHTSIDE 30
-#define REV_LEFTSIDE 29
-#define REV_LEFT 46
-#define REV_RIGHT 47
+#define REV_LEFTSIDE 37
+#define REV_LEFT 47
+#define REV_RIGHT 46
 #define REV_RIGHTSIDE 39
 
 //超声PIN
 #define HCL_TRIG 43
-#define HCL_ECHO 41
+#define HCL_ECHO 42
 #define HCR_TRIG 45
 #define HCR_ECHO 44
 
 //电磁铁继电器PIN
-#define RELAY 40
+#define RELAY 41
 
 //强制刹车时间
-#define BRAKING 1000
+#define BRAKING 800
 
 //左侧动力补偿
 #define SPD_COMP 50
 
 //基准速度
-#define SPD_STAND 150
+int SPD_STAND = 140;
 
 //修正减速
-#define CORR_REDUCE 130
+int CORR_REDUCE = 110;
 
 //基准倒行速度
-#define SPD_STAND_REV 150
+int SPD_STAND_REV = 130;
 
 //倒行修正减速
-#define CORR_REDUCE_REV 130
+int CORR_REDUCE_REV = 120;
 
 //转向速度
-#define SPD_TURN_POS 190
-#define SPD_TURN_NEG 130
+#define SPD_TURN_POS 180
+#define SPD_TURN_NEG 80
 
 //强制转向时间
 #define TURNNING 600
 
 //强制回正时间 170
-#define TURNING_RETURN 1
+#define TURNING_RETURN 50
 
 //转向刹车时间
 #define TURNING_BRAKE 1000
@@ -102,8 +103,8 @@
 #define REVERSE_KEEP 300
 
 //启动直行时间
-#define START_FORWARD 1000
-
+#define START_FORWARD 500
+ 
 //终止倒车时间
 #define END_REVERSE 1000
 
@@ -111,20 +112,26 @@
 #define STOP_DIST_A 20.00
 #define STOP_DIST_B 5.00
 
-//吸合距离(cm)
-#define ATTACH_DIST 5.00
+//吸合倒车时间
+#define ATTACH_TIME 8000
+
+//超声平滑次数
+#define SOR_SMOOTH 3
 
 //超声超时时间
 #define TIMEOUT 10000
 
 //超声允许误差
-#define SONAR_DIFF_MAX 0.3
+#define SONAR_DIFF_MAX 0.2
 
 //超声修正转速
-#define SOR_CORRECT_SPD 150
+#define SOR_CORRECT_SPD 180
+
+//超声刹车时间
+#define SOR_BRAKE 100
 
 //超声单步时间
-#define SOR_STEP_TIME 100
+#define SOR_STEP_TIME 80
 
 /*状态机
 	FWD：循迹直行
@@ -150,9 +157,12 @@
 #define REF 8
 #define MAG 9
 #define SOR 10
+#define TREV 11
 #define KEYNODE 0xFF
 
-#define STORAGE_ON_LEFT {KEYNODE,1},{LFT,1},{STP,1},{REV,2},{RGT,1}
+#define START_PROCEDURE {FWD,1},{RGT,1},{FWD,2},{REV,2},{LFT,1},{FWD,2},{REV,1},{TREV,3}
+#define STORAGE_ON_RIGHT {RGT,1},{STP,1},{REV,2},{LFT,1}
+#define STORAGE_ON_LEFT {LFT,1},{STP,1},{REV,2},{RGT,1}
 
 void correct(int);
 void forward();
@@ -175,7 +185,12 @@ int stat = RUN;
 long zerotime = 0;
 
 //任务流程。第一索引标记一级步骤，第二索引标记步骤类型及重复次数，下面称一级步骤中重复执行的部分为二级步骤
-short procedure[][2] = {{FWD,1},{LFT,1},{FWD,2},STORAGE_ON_LEFT,{FWD,2},STORAGE_ON_LEFT,{FWD,2},STORAGE_ON_LEFT,{FWD,1},{SOR,1},{REV,3},{FWD,1},{RGT,1},{FWD,2},{OVR,1}};
+//short procedure[][2] = {START_PROCEDURE,{FWD,1},{LFT,1},{FWD,2},STORAGE_ON_RIGHT,{FWD,1},{SOR,1},{REV,3},{FWD,1},{RGT,1},{FWD,2},{OVR,1}};
+short procedure[][2] = {START_PROCEDURE,{FWD,1},{LFT,1},{FWD,3},
+STORAGE_ON_LEFT,{FWD,2},
+STORAGE_ON_LEFT,{FWD,2},
+STORAGE_ON_LEFT,{FWD,1},{REV,1},{RGT,1},{FWD,2},{OVR,1}};
+//short procedure[][2] = {{TREV,1},{OVR,1}};
 short step_rp = 0;
 short step = 0;
 int procedure_len = 0;
@@ -227,14 +242,16 @@ void setup(){
 	pinMode(RELAY, OUTPUT);
 	digitalWrite(HCL_TRIG, 0);
 	digitalWrite(HCR_TRIG, 0);
+	digitalWrite(RELAY, 0);
 	setlogic(0,0,0,0);
 
-	Serial.begin(115200);
-	while(Serial.read() != WAKE_BYTE);
+	if(DEBUG == 0){
+		Serial.begin(115200);
+		while(Serial.read() != WAKE_BYTE);
+	}
 
-	zerotime = millis();
+	//zerotime = millis();
 	setlogic(1,0,1,0);
-
 
 	for(int i=0;i<3;++i){
 	    ir_map[0] = (short)digitalRead(LEFTSIDE);
@@ -243,11 +260,17 @@ void setup(){
 	    ir_map[3] = (short)digitalRead(RIGHT);
 	    ir_map[4] = (short)digitalRead(RIGHTSIDE);
   	}
+
+  	writespeed(SPD_STAND,SPD_STAND);
+  	delay(START_FORWARD);
 }
 
 void loop(){
 	if(DEBUG == 1){
-		Serial.println(s_dist(0));
+		Serial.print(digitalRead(REV_LEFTSIDE));
+		Serial.print(digitalRead(REV_LEFT));
+		Serial.print(digitalRead(REV_RIGHT));
+		Serial.print(digitalRead(REV_RIGHTSIDE));
 		return;
 	}
 
@@ -272,12 +295,12 @@ void loop(){
 			setlogic(1,0,1,0);
 
 		//如果在左转去货架的关键节点超时，则取消左转
-		if(procedure[step][0] == KEYNODE){
+		/*if(procedure[step][0] == KEYNODE){
 			if(millis() - zerotime >= TIME_MAX){
 				procedure_fold(step,5,procedure_len);
 				procedure_len -= 5;
 			}
-		}
+		}*/
 
 		//检测当前一级步骤是否已经重复执行完毕
 		if(step_rp >= procedure[step][1]){
@@ -342,8 +365,14 @@ void loop(){
 					brake(BRAKING);
 					s_cali();
 					Serial.write(STAGE_A_BYTE);
-					//delay(3000);
-					while(Serial.read() != WAKE_BYTE);
+					char byte = Serial.read();
+					while(byte != WAKE_BYTE && byte != QUIT_BYTE)
+						byte = Serial.read();
+					if(byte = QUIT_BYTE){		//接受QUIT信号后直接退出
+						stop_flag = 0;
+						step_rp ++;
+						break;
+					}
 					stop_flag = 1;
 					break;
 				}
@@ -352,8 +381,9 @@ void loop(){
 					brake(BRAKING);
 					s_cali();
 					Serial.write(STAGE_B_BYTE);
-					//delay(3000);
-					while(Serial.read() != WAKE_BYTE);
+					char byte = Serial.read();
+					while(byte != WAKE_BYTE && byte != QUIT_BYTE)
+						byte = Serial.read();
 					stop_flag = 0;
 					step_rp ++;
 					break;
@@ -384,6 +414,18 @@ void loop(){
 			s_cali();
 			step_rp++;
 			break;
+
+			case TREV:
+			SPD_STAND = 170;
+			CORR_REDUCE = 140;
+			SPD_STAND_REV = 150;
+			CORR_REDUCE_REV = 130;
+			setlogic(0,1,0,1);
+			rev_flag = 1;
+			digitalWrite(RELAY,1);
+			course_time(COURSE_REV,2000);
+			step_rp++;
+			break;
 		}
 
 		for(int i=0;i<5;++i)
@@ -404,8 +446,7 @@ void loop(){
 	}
 }
 
-void serialEvent(){
-	Serial.print("detected = ");
+/*	Serial.print("detected = ");
 	int recv = Serial.read();
 	Serial.print(recv);
 	if(recv == RUN || recv == PULSE || recv == STOP){
@@ -429,7 +470,7 @@ void serialEvent(){
 		turn(1);
 
 	brake(500);
-}
+}*/
 
 //设定轨迹修正 stat=0：向左修正
 void correct(int stat){
@@ -459,7 +500,7 @@ void forward(){
 void turn(int stat){
 	writespeed(0,0);
 
-	m_update(stat);
+	//m_update(stat);
 
 	if(stat){
 		setlogic(0,1,1,0);
@@ -533,10 +574,10 @@ int course(int mode){
 	else if(mode == COURSE_REV){
 		if(ir_map_rev[1] == 0 && ir_map_rev[2] == 0)
 			forward();
-		if(ir_map_rev[0] == 0 || ir_map_rev[3] == 0)
-			correct(ir_map_rev[3]);
-		else if(ir_map_rev[1] == 0 || ir_map_rev[2] == 0)
+		if(ir_map_rev[1] == 0 || ir_map_rev[2] == 0)
 			correct(ir_map_rev[2]);
+		else if(ir_map_rev[0] == 0 || ir_map_rev[3] == 0)
+			correct(ir_map_rev[3]);
 		else
 			forward();
 	}
@@ -593,33 +634,41 @@ void course_time(int mode, int time){
 }
 
 //超声测距，side = 0：左侧
-double s_dist(int side){
+double _dist = 0.0;
+double s_dist(int side,int smooth){
+	_dist = 0.0;
 	if(side == 0){
-		digitalWrite(HCL_TRIG,HIGH);
-		delayMicroseconds(10);
-		digitalWrite(HCL_TRIG,LOW);
-		return (double)pulseIn(HCL_ECHO, HIGH, TIMEOUT) / 58.0;
+		for(int i=0;i<smooth;++i){
+			digitalWrite(HCL_TRIG,HIGH);
+			delayMicroseconds(10);
+			digitalWrite(HCL_TRIG,LOW);
+			_dist += (double)pulseIn(HCL_ECHO, HIGH, TIMEOUT) / 58.0;
+		}
 	}else{
-		digitalWrite(HCR_TRIG,HIGH);
-		delayMicroseconds(10);
-		digitalWrite(HCR_TRIG,LOW);
-		return (double)pulseIn(HCR_ECHO, HIGH, TIMEOUT) / 58.0;
+		for(int i=0;i<smooth;++i){
+			digitalWrite(HCR_TRIG,HIGH);
+			delayMicroseconds(10);
+			digitalWrite(HCR_TRIG,LOW);
+			_dist += (double)pulseIn(HCR_ECHO, HIGH, TIMEOUT) / 58.0;
+		}
 	}
+	return _dist/(double)smooth;
 }
 
 double distl,distr;
 void s_cali(){
-	distl = s_dist(0);
-	distr = s_dist(1);
+	distl = s_dist(0,SOR_SMOOTH);
+	distr = s_dist(1,SOR_SMOOTH);
 	while((double)abs(distl - distr) >= SONAR_DIFF_MAX){
-		distl = s_dist(0);
-		distr = s_dist(1);
+		distl = s_dist(0,SOR_SMOOTH);
+		distr = s_dist(1,SOR_SMOOTH);
 		if(distl > distr)
 			setlogic(1,0,1,0);
 		else
 			setlogic(0,1,1,0);
 		writespeed(SOR_CORRECT_SPD,0);
 		delay(SOR_STEP_TIME);
+		brake(SOR_BRAKE);
 	}
 	brake(BRAKE_STABLE);
 }
